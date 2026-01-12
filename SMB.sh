@@ -32,7 +32,7 @@ fi
 
 # Set ownership and permissions
 chown -R "$SMB_USER":"$SMB_USER" "$MOUNT_PATH"
-chmod -R 775 "$MOUNT_PATH"
+chmod -R 2775 "$MOUNT_PATH"
 
 # Add Samba user
 (echo "$SMB_PASS"; echo "$SMB_PASS") | smbpasswd -s -a "$SMB_USER"
