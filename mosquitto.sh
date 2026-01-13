@@ -19,27 +19,27 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-echo "[INFO] Installing dependencies..."
-dnf -y install podman podman-plugins systemd-container
-
 # ---------- Directories ----------
 echo "[INFO] Creating directories..."
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
-chmod 755 /opt /opt/containers
-chmod 755 "$BASE_DIR"
-chmod 755 "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
 
 # ---------- mosquitto.conf ----------
 echo "[INFO] Writing mosquitto.conf..."
 cat > "$CONF_FILE" <<'EOF'
+# Use per-listener security settings (recommended)
 per_listener_settings false
+
+# Allow anonymous connections (not secure, for testing/demo)
 allow_anonymous true
 
+# Define a listener that accepts connections from all interfaces (default port 1883)
 listener 1883 0.0.0.0
 
+# Enable message persistence (store messages across broker restarts)
 persistence true
 persistence_location /mosquitto/data/
 
+# Log to file (customize path as needed)
 log_dest file /mosquitto/log/mosquitto.log
 log_type error
 log_type warning
@@ -52,8 +52,8 @@ echo "[INFO] Writing quadlet file..."
 cat > "$QUADLET_FILE" <<'EOF'
 [Unit]
 Description=Mosquitto MQTT Broker
-After=network-online.target
 Wants=network-online.target
+After=network-online.target
 
 [Container]
 ContainerName=mosquitto
@@ -74,7 +74,7 @@ TimeoutStartSec=300
 WantedBy=multi-user.target
 EOF
 
-# ---------- Enable service ----------
+# ---------- Activate ----------
 echo "[INFO] Reloading systemd..."
 systemctl daemon-reload
 
@@ -85,6 +85,6 @@ echo "[INFO] Enabling and starting mosquitto.service..."
 systemctl enable --now mosquitto.service
 
 echo
-echo "[INFO] Installation complete!"
-echo "Check status with:"
+echo "[INFO] Done."
+echo "Check status:"
 echo "  systemctl status mosquitto.service"
