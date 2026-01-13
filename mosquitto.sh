@@ -82,9 +82,9 @@ echo "[INFO] Pulling image..."
 podman pull "$IMAGE"
 
 echo "[INFO] Enabling and starting mosquitto.service..."
-systemctl enable --now mosquitto.service
+systemctl enable --now mosquitto
 
 echo
 echo "[INFO] Done."
 echo "Check status:"
-echo "  systemctl status mosquitto.service"
+echo "  systemctl status mosquitto"
