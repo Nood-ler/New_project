@@ -185,7 +185,7 @@ create_samba_users_and_shares() {
    path = ${SHARE_DIR}
    valid users = ${USERNAME}
    read only = no
-   browsable = no
+   browsable = yes
    guest ok = no
    create mask = 0700
    directory mask = 0700
