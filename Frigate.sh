@@ -69,6 +69,7 @@ Image=${IMAGE}
 Network=host
 # Use an EnvironmentFile so secrets are not baked into the quadlet file
 EnvironmentFile=${ENV_FILE}
+
 # Mounts/Volumes - use :Z for proper SELinux label on Fedora/RHEL family
 Volume=${MEDIA_DIR}:/media:Z
 Volume=${CONFIG_DIR}:/config:Z
@@ -76,7 +77,11 @@ Volume=/etc/localtime:/etc/localtime:ro
 # tmpfs for cache (quadlet accepts tmpfs-size in bytes)
 Mount=type=tmpfs,target=/tmp/cache,tmpfs-size=${TMPFS_SIZE}
 ShmSize=${SHM_SIZE}
-AutoUpdate=registry
+# Add both privileged mode and CAP_PERFMON
+AddDevice=/dev/dri
+SecurityLabelDisable=true
+AddCapability=PERFMON
+PodmanArgs=--privileged
 
 [Service]
 Restart=always
@@ -125,4 +130,3 @@ Notes:
 - To view logs: journalctl -u ${SERVICE} -f
 - To inspect container: podman ps -a --filter name=${CONTAINER_NAME}
 EOF
-
