@@ -51,7 +51,6 @@ set_permissions_acls() {
   fi
 
   chown root:root "$MOUNTPOINT"
-  # SGID (2), rwxrwxr-x (775) -> 2775
   chmod 0755 "$MOUNTPOINT"
 
   # Optional: default ACLs so new files/directories inherit group and default perms
