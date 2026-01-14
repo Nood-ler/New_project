@@ -1,31 +1,26 @@
 #!/bin/bash
 
-# =======================
-# Global Variables
-# =======================
+# Global Variables 
 RAID_ARRAY_NAME="/dev/md0"
 FILESYSTEM_TYPE="ext4"
 DEFAULT_MOUNT_POINT="/mnt/raid1_share"
-DEFAULT_OWNER="nobody:nogroup"
+DEFAULT_OWNER="nobody:nobody"
 DEFAULT_CHMOD="0775"
 
-# =======================
-# Error handling
-# =======================
+#  Error messages 
 error_exit() {
   echo "ERROR: $1" >&2
   exit 1
 }
 
-# =======================
-# Root check
-# =======================
+# Check if the script is running as root
 check_root() {
   echo "-------------------------------------------------------------------"
   echo "  Checking for root privileges..."
   if [ "$EUID" -ne 0 ]; then
-    echo "  ERROR: This script must be run as root."
-    echo "  Use: sudo ./$(basename "$0")"
+    echo "  ERROR: This script requires root privileges to configure RAID."
+    echo "  Please run it using 'sudo':"
+    echo "  sudo ./$(basename "$0")"
     echo "-------------------------------------------------------------------"
     exit 1
   fi
@@ -33,15 +28,14 @@ check_root() {
   echo "-------------------------------------------------------------------"
 }
 
-# =======================
-# mdadm check (Debian)
-# =======================
+# Check for mdadm package and try to install with dnf (Fedora)
 check_mdadm() {
   echo "  Checking for 'mdadm' package..."
-  if ! dpkg -s mdadm &>/dev/null; then
-    echo "  'mdadm' not found. Installing..."
-    apt update && apt install -y mdadm \
-      || error_exit "Failed to install mdadm."
+  if ! rpm -q mdadm &>/dev/null; then
+    echo "  'mdadm' package not found. Attempting to install it via dnf..."
+    if ! dnf install -y mdadm; then
+      error_exit "Failed to install 'mdadm' via dnf."
+    fi
     echo "  'mdadm' installed successfully."
   else
     echo "  'mdadm' is already installed."
@@ -51,153 +45,219 @@ check_mdadm() {
 
 clear
 echo "-------------------------------------------------------------------"
-echo "  --- Starting RAID 1 Array Configuration Script (Debian) ---"
+echo "  --- Starting RAID 1 Array Configuration Script ---"
 echo "-------------------------------------------------------------------"
 echo ""
-echo "  WARNING: THIS WILL ERASE ALL DATA ON THE SELECTED DISKS!"
+echo "  WARNING: This script will ERASE ALL DATA on the disks you select."
+echo "           Proceed with EXTREME CAUTION. Data backup is essential!"
 echo ""
-sleep 3
+echo "-------------------------------------------------------------------"
+sleep 2
 
 check_root
 check_mdadm
 
-# =======================
-# Disk selection
-# =======================
+# Select Disks (multiple allowed; finish by typing DONE in ALL CAPS)
 clear
 echo "-------------------------------------------------------------------"
 echo "  --- Disk Selection for RAID 1 ---"
 echo "-------------------------------------------------------------------"
+echo "  Available block devices (look for TYPE='disk' and no MOUNTPOINT):"
 lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
 echo ""
+echo "  Enter device paths one by one. When finished, type DONE (all uppercase)."
+echo "  Example device: /dev/sdb"
+echo ""
 
-read -rp "  Enter FIRST disk (e.g., /dev/sdb): " DEVICE1
-read -rp "  Enter SECOND disk (e.g., /dev/sdc): " DEVICE2
+DEVICES=()
+while true; do
+  read -rp "  Enter device path (or DONE to finish): " DEV
+  if [[ "$DEV" == "DONE" ]]; then
+    break
+  fi
 
-if [[ -z "$DEVICE1" || -z "$DEVICE2" ]]; then
-  error_exit "Both disk paths are required."
-elif [[ ! -b "$DEVICE1" || ! -b "$DEVICE2" ]]; then
-  error_exit "Invalid block device(s)."
-elif [[ "$DEVICE1" == "$DEVICE2" ]]; then
-  error_exit "Disks must be different."
+  if [[ -z "$DEV" ]]; then
+    echo "  No input provided. Please enter a device path or DONE."
+    continue
+  fi
+
+  if [[ ! -b "$DEV" ]]; then
+    echo "  '$DEV' is not a valid block device. Please check and try again."
+    continue
+  fi
+
+  # check for duplicates
+  dup=false
+  for d in "${DEVICES[@]}"; do
+    if [[ "$d" == "$DEV" ]]; then
+      dup=true
+      break
+    fi
+  done
+  if $dup; then
+    echo "  '$DEV' already added. Choose another device or type DONE."
+    continue
+  fi
+
+  DEVICES+=("$DEV")
+  echo "  Added: $DEV (total selected: ${#DEVICES[@]})"
+done
+
+# Validate number of devices
+if (( ${#DEVICES[@]} < 2 )); then
+  error_exit "At least two devices are required for RAID 1. Exiting."
 fi
 
+# Confirm devices
 echo ""
-echo "  Selected disks: $DEVICE1 and $DEVICE2"
-read -rp "  Confirm? (y/N): " confirm
-confirm=${confirm:-N}
-[[ "$confirm" =~ ^[Yy]$ ]] || error_exit "Cancelled."
-
-# =======================
-# Zero superblocks
-# =======================
+echo "  You have selected the following devices for RAID 1:"
+for d in "${DEVICES[@]}"; do
+  echo "   - $d"
+done
+read -rp "  Confirm these are the correct devices to format and use for RAID 1? (y/N): " confirm_devices
+confirm_devices=${confirm_devices:-N}
+if [[ ! "$confirm_devices" =~ ^[Yy]$ ]]; then
+  error_exit "Device selection cancelled. Exiting."
+fi
 clear
-echo "-------------------------------------------------------------------"
-echo "  --- Zeroing Superblocks ---"
-echo "-------------------------------------------------------------------"
-read -rp "  THIS DESTROYS DATA. Continue? (y/N): " confirm_zero
-confirm_zero=${confirm_zero:-N}
-[[ "$confirm_zero" =~ ^[Yy]$ ]] || error_exit "Cancelled."
 
-mdadm --zero-superblock "$DEVICE1" || true
-mdadm --zero-superblock "$DEVICE2" || true
+# Zero Superblocks 
+echo "-------------------------------------------------------------------"
+echo "  --- Zeroing Superblocks on Selected Devices ---"
+echo "-------------------------------------------------------------------"
+echo "  This will destroy any existing RAID metadata or filesystems on the selected devices."
+read -rp "  Are you absolutely sure you want to proceed with zeroing superblocks? (y/N): " confirm_zero
+confirm_zero=${confirm_zero:-N}
+if [[ ! "$confirm_zero" =~ ^[Yy]$ ]]; then
+  error_exit "Zeroing superblocks cancelled. Exiting."
+fi
+
+for dev in "${DEVICES[@]}"; do
+  echo "  Zeroing superblock on $dev..."
+  mdadm --zero-superblock "$dev" || echo "  Warning: Failed to zero superblock on $dev. Continuing..."
+done
+echo "  Superblocks zeroed (or skipped where failing)."
+echo "-------------------------------------------------------------------"
 sleep 2
 
-# =======================
-# Create RAID
-# =======================
+# Create RAID 1 Array
 clear
 echo "-------------------------------------------------------------------"
 echo "  --- Creating RAID 1 Array ---"
 echo "-------------------------------------------------------------------"
-mdadm --create "$RAID_ARRAY_NAME" \
-  --level=1 \
-  --raid-devices=2 \
-  "$DEVICE1" "$DEVICE2" \
-  || error_exit "RAID creation failed."
-
+echo "  Creating RAID 1 array '$RAID_ARRAY_NAME' with ${#DEVICES[@]} devices..."
+mdadm --create "$RAID_ARRAY_NAME" --level=1 --raid-devices=${#DEVICES[@]} "${DEVICES[@]}" || error_exit "Failed to create RAID array."
+echo "  RAID 1 array creation initiated. This may take some time to synchronize."
+echo "  You can monitor synchronization status using: 'cat /proc/mdstat'"
+echo ""
+echo "  Current RAID status:"
 cat /proc/mdstat
+echo "-------------------------------------------------------------------"
 sleep 5
 
-# =======================
-# Persist RAID (Debian)
-# =======================
+# Persist RAID Configuration 
 clear
 echo "-------------------------------------------------------------------"
-echo "  --- Saving RAID Configuration ---"
+echo "  --- Persisting RAID Configuration ---"
 echo "-------------------------------------------------------------------"
-mdadm --detail --scan > /etc/mdadm/mdadm.conf \
-  || error_exit "Failed to save mdadm.conf"
+echo "  Saving RAID array configuration to /etc/mdadm.conf..."
+mdadm --detail --scan > /etc/mdadm.conf || error_exit "Failed to save /etc/mdadm.conf. Manual intervention required."
+echo "  RAID configuration saved."
 
-update-initramfs -u \
-  || error_exit "Failed to update initramfs"
-
+echo "  Updating initramfs to ensure boot with RAID array..."
+dracut -H -f /boot/initramfs-$(uname -r).img $(uname -r) || echo "  Warning: Failed to update initramfs. System may still boot but check manually."
+echo "  Initramfs update attempted."
+echo "-------------------------------------------------------------------"
 sleep 2
 
-# =======================
-# Format RAID
-# =======================
+# Format RAID Array 
 clear
 echo "-------------------------------------------------------------------"
 echo "  --- Formatting RAID Array ---"
 echo "-------------------------------------------------------------------"
-mkfs.$FILESYSTEM_TYPE "$RAID_ARRAY_NAME" \
-  || error_exit "Formatting failed"
-
+echo "  Formatting '$RAID_ARRAY_NAME' with $FILESYSTEM_TYPE filesystem..."
+mkfs.$FILESYSTEM_TYPE "$RAID_ARRAY_NAME" || error_exit "Failed to format RAID array '$RAID_ARRAY_NAME'."
+echo "  RAID array formatted successfully."
+echo "-------------------------------------------------------------------"
 sleep 2
 
-# =======================
-# Mount & fstab
-# =======================
+# Configure Mount Point and fstab 
 clear
 echo "-------------------------------------------------------------------"
-echo "  --- Mount Configuration ---"
+echo "  --- Configuring Mount Point and fstab ---"
 echo "-------------------------------------------------------------------"
-read -rp "  Mount point [$DEFAULT_MOUNT_POINT]: " CUSTOM_MOUNT_POINT
+read -rp "  Enter the desired mount point for the RAID array (e.g., '$DEFAULT_MOUNT_POINT', leave empty for default): " CUSTOM_MOUNT_POINT
 CUSTOM_MOUNT_POINT=${CUSTOM_MOUNT_POINT:-$DEFAULT_MOUNT_POINT}
 
-mkdir -p "$CUSTOM_MOUNT_POINT" || error_exit "mkdir failed"
+echo "  Creating mount point directory '$CUSTOM_MOUNT_POINT'..."
+mkdir -p "$CUSTOM_MOUNT_POINT" || error_exit "Failed to create mount point directory '$CUSTOM_MOUNT_POINT'."
+echo "  Mount point created."
 
-echo "$RAID_ARRAY_NAME $CUSTOM_MOUNT_POINT $FILESYSTEM_TYPE defaults 0 0" \
-  >> /etc/fstab || error_exit "fstab update failed"
+echo "  Adding entry to /etc/fstab for automatic mounting..."
+echo "$RAID_ARRAY_NAME $CUSTOM_MOUNT_POINT $FILESYSTEM_TYPE defaults 0 0" >> /etc/fstab || error_exit "Failed to update /etc/fstab. Manual edit required."
+echo "  fstab updated. Verifying fstab entry..."
 
-mount "$CUSTOM_MOUNT_POINT" || error_exit "Mount failed"
+echo "  Mounting RAID array to '$CUSTOM_MOUNT_POINT'..."
+mount "$CUSTOM_MOUNT_POINT" || error_exit "Failed to mount RAID array to '$CUSTOM_MOUNT_POINT'. Check fstab and logs."
+echo "  RAID array mounted successfully."
+echo "-------------------------------------------------------------------"
 sleep 2
 
-# =======================
-# Permissions
-# =======================
+# Set Permissions 
 clear
 echo "-------------------------------------------------------------------"
-echo "  --- Permissions ---"
+echo "  --- Setting Permissions on Mount Point ---"
 echo "-------------------------------------------------------------------"
-read -rp "  Owner [$DEFAULT_OWNER]: " CUSTOM_OWNER
+read -rp "  Enter desired owner for '$CUSTOM_MOUNT_POINT' (e.g., 'user:group', default '$DEFAULT_OWNER'): " CUSTOM_OWNER
 CUSTOM_OWNER=${CUSTOM_OWNER:-$DEFAULT_OWNER}
-chown -R "$CUSTOM_OWNER" "$CUSTOM_MOUNT_POINT" || true
 
-read -rp "  Permissions [$DEFAULT_CHMOD]: " CUSTOM_CHMOD
-CUSTOM_CHMOD=${CUSTOM_CHMOD:-$DEFAULT_CHMOD}
-chmod "$CUSTOM_CHMOD" "$CUSTOM_MOUNT_POINT" || true
+echo "  Setting ownership of '$CUSTOM_MOUNT_POINT' to '$CUSTOM_OWNER'..."
+chown -R "$CUSTOM_OWNER" "$CUSTOM_MOUNT_POINT" || echo "  Warning: Failed to set ownership. Manual intervention might be needed."
 
-# =======================
-# Verification
-# =======================
+read -rp "  Enter desired permissions for '$CUSTOM_MOUNT_POINT' (e.g., '0770', default '$DEFAULT_CHMOD'): " CUSTOM_CHMOD
+if [ -n "$CUSTOM_CHMOD" ]; then 
+  if [[ ! "$CUSTOM_CHMOD" =~ ^[0-7]{3,4}$ ]]; then
+    echo "  Warning: Invalid chmod format. Using default '$DEFAULT_CHMOD'."
+    CUSTOM_CHMOD="$DEFAULT_CHMOD"
+  fi
+else
+  CUSTOM_CHMOD="$DEFAULT_CHMOD"
+fi
+echo "  Setting permissions of '$CUSTOM_MOUNT_POINT' to '$CUSTOM_CHMOD'..."
+chmod "$CUSTOM_CHMOD" "$CUSTOM_MOUNT_POINT" || echo "  Warning: Failed to set permissions. Manual intervention might be needed."
+echo "  Permissions set."
+echo "-------------------------------------------------------------------"
+sleep 2
+
+# Verification 
 clear
 echo "-------------------------------------------------------------------"
-echo "  --- RAID 1 SETUP COMPLETE ---"
+echo "  --- RAID 1 Setup Completed ---"
 echo "-------------------------------------------------------------------"
-echo " RAID Array : $RAID_ARRAY_NAME"
-echo " Devices    : $DEVICE1 $DEVICE2"
-echo " Filesystem : $FILESYSTEM_TYPE"
-echo " Mount      : $CUSTOM_MOUNT_POINT"
+echo "  Summary of RAID configuration:"
 echo ""
-df -h "$CUSTOM_MOUNT_POINT"
+echo "  RAID Array: $RAID_ARRAY_NAME (RAID 1)"
+echo -n "  Devices:    "
+printf "%s " "${DEVICES[@]}"
 echo ""
+echo "  Filesystem: $FILESYSTEM_TYPE"
+echo "  Mount Point: $CUSTOM_MOUNT_POINT"
+echo "  Owner:      $CUSTOM_OWNER"
+echo "  Permissions: $CUSTOM_CHMOD"
+echo ""
+echo "  Current disk usage and mounts:"
+df -h "$CUSTOM_MOUNT_POINT" 2>/dev/null || echo "  Failed to display mount status for $CUSTOM_MOUNT_POINT. Check 'df -h'."
+echo ""
+echo "  RAID status (check for 'resync' progress if any):"
 cat /proc/mdstat
 echo ""
+echo "  Final lsblk output:"
 lsblk -f
 echo ""
-echo " RAID is persistent and will mount on boot."
 echo "-------------------------------------------------------------------"
+echo "  RAID 1 array has been successfully created, formatted, and mounted."
+echo "  It is configured to mount automatically on boot."
+echo "-------------------------------------------------------------------"
+echo ""
 
 exit 0
