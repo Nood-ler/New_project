@@ -1,242 +1,263 @@
 #!/bin/bash
-# setup-samba.sh
-# Sets up Samba with per-user isolated shares, firewall, SELinux, and ACLs.
-# Type "DONE" (uppercase) when prompted for username to finish user creation.
 
-set -euo pipefail
-IFS=$'\n\t'
+# Global Variables 
+RAID_ARRAY_NAME="/dev/md0"
+FILESYSTEM_TYPE="ext4"
+DEFAULT_MOUNT_POINT="/mnt/raid1_share"
+DEFAULT_OWNER="nobody:nobody"
+DEFAULT_CHMOD="0775"
 
-# Ensure script is run as root
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root."
+#  Error messages 
+error_exit() {
+  echo "ERROR: $1" >&2
   exit 1
-fi
-
-# Helper: package install wrapper (dnf/yum/apt)
-install_packages() {
-  pkgs=("$@")
-  if command -v dnf &>/dev/null; then
-    dnf install -y "${pkgs[@]}" || true
-  elif command -v yum &>/dev/null; then
-    yum install -y "${pkgs[@]}" || true
-  elif command -v apt-get &>/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" || true
-  else
-    echo "No supported package manager found (dnf/yum/apt). Please install: ${pkgs[*]}"
-  fi
 }
 
-######### User input #########
-read -rp "Enter the full path of the mount point to share (e.g. /srv/samba): " MOUNTPOINT
-MOUNTPOINT="${MOUNTPOINT%/}"  # remove trailing slash
-
-if [ -z "$MOUNTPOINT" ]; then
-  echo "Mount point cannot be empty."
-  exit 1
-fi
-
-if [ ! -d "$MOUNTPOINT" ]; then
-  echo "Directory $MOUNTPOINT does not exist. Creating..."
-  mkdir -p "$MOUNTPOINT"
-fi
-
-######### Functions #########
-
-set_permissions_acls() {
-  echo "Applying recommended ACLs on ${MOUNTPOINT}..."
-  # Ensure group exists
-  if ! getent group sambashare >/dev/null; then
-    groupadd sambashare || true
+# Check if the script is running as root
+check_root() {
+  echo "-------------------------------------------------------------------"
+  echo "  Checking for root privileges..."
+  if [ "$EUID" -ne 0 ]; then
+    echo "  ERROR: This script requires root privileges to configure RAID."
+    echo "  Please run it using 'sudo':"
+    echo "  sudo ./$(basename "$0")"
+    echo "-------------------------------------------------------------------"
+    exit 1
   fi
-
-  chown root:root "$MOUNTPOINT"
-  chmod 0755 "$MOUNTPOINT"
-
-  # Optional: default ACLs so new files/directories inherit group and default perms
-  if command -v setfacl &>/dev/null; then
-    setfacl -m g:sambashare:rwx "$MOUNTPOINT" || true
-    setfacl -d -m g:sambashare:rwx "$MOUNTPOINT" || true
-  else
-    echo "setfacl not found; skipping default ACLs. Install acl package if you want ACLs."
-  fi
+  echo "  Root privileges confirmed."
+  echo "-------------------------------------------------------------------"
 }
 
-enable_services_and_firewall() {
-  echo "Installing/ensuring samba and firewall packages are present..."
-  # Install samba and firewall packages if missing
-  if ! rpm -q samba &>/dev/null && ! dpkg -s samba &>/dev/null; then
-    install_packages samba samba-client samba-common firewalld acl
-  else
-    install_packages firewalld acl || true
-  fi
-
-  echo "Enabling and starting firewalld, smb and nmb..."
-  # Enable/start
-  systemctl enable --now firewalld || true
-  # Some distros name samba service differently; attempt common names
-  systemctl enable --now smb nmb 2>/dev/null || systemctl enable --now samba 2>/dev/null || true
-
-  echo "Configuring firewall for Samba..."
-  if command -v firewall-cmd &>/dev/null; then
-    firewall-cmd --permanent --add-service=samba || true
-    # also ensure NETBIOS ports (137-139) and samba (445) are open if service not present
-    firewall-cmd --reload || true
-  else
-    echo "firewall-cmd not found; please ensure your firewall allows Samba (ports 137-139/udp/tcp and 445/tcp)."
-  fi
-}
-
-configure_selinux_for_samba() {
-  if command -v getenforce &>/dev/null; then
-    SELINUX_STATUS=$(getenforce || echo "Disabled")
-  else
-    SELINUX_STATUS="Disabled"
-  fi
-
-  if [[ "$SELINUX_STATUS" =~ Enforce|Permissive ]]; then
-    echo "Configuring SELinux file contexts and booleans for Samba..."
-
-    if ! command -v semanage &>/dev/null; then
-      echo "semanage not found; attempting to install policycoreutils-python-utils or equivalents..."
-      install_packages policycoreutils-python-utils policycoreutils-python python3-policycoreutils || true
+# Check for mdadm package and try to install with dnf (Fedora)
+check_mdadm() {
+  echo "  Checking for 'mdadm' package..."
+  if ! rpm -q mdadm &>/dev/null; then
+    echo "  'mdadm' package not found. Attempting to install it via dnf..."
+    if ! dnf install -y mdadm; then
+      error_exit "Failed to install 'mdadm' via dnf."
     fi
-
-    if command -v semanage &>/dev/null; then
-      semanage fcontext -a -t samba_share_t "${MOUNTPOINT}(/.*)?" || true
-      restorecon -Rv "${MOUNTPOINT}" || true
-    else
-      echo "Warning: semanage not available; cannot set SELinux filecontext automatically."
-    fi
-
-    # Set booleans so Samba can serve home-style directories and export read/write
-    if command -v setsebool &>/dev/null; then
-      setsebool -P samba_enable_home_dirs 1 || true
-      setsebool -P samba_export_all_rw 1 || true
-    fi
+    echo "  'mdadm' installed successfully."
   else
-    echo "SELinux appears disabled or not present. Skipping SELinux configuration."
+    echo "  'mdadm' is already installed."
   fi
+  echo "-------------------------------------------------------------------"
 }
 
-backup_smb_conf() {
-  if [ -f /etc/samba/smb.conf ]; then
-    cp /etc/samba/smb.conf /etc/samba/smb.conf.bak.$(date +%F_%T) || true
-    echo "Backed up existing /etc/samba/smb.conf"
-  else
-    # create a minimal smb.conf if not exists
-    cat > /etc/samba/smb.conf <<'EOF'
-[global]
-  workgroup = WORKGROUP
-  server string = Samba Server
-  security = user
-EOF
-    echo "Created minimal /etc/samba/smb.conf"
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- Starting RAID 1 Array Configuration Script ---"
+echo "-------------------------------------------------------------------"
+echo ""
+echo "  WARNING: This script will ERASE ALL DATA on the disks you select."
+echo "           Proceed with EXTREME CAUTION. Data backup is essential!"
+echo ""
+echo "-------------------------------------------------------------------"
+sleep 2
+
+check_root
+check_mdadm
+
+# Select Disks (multiple allowed; finish by typing DONE in ALL CAPS)
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- Disk Selection for RAID 1 ---"
+echo "-------------------------------------------------------------------"
+echo "  Available block devices (look for TYPE='disk' and no MOUNTPOINT):"
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
+echo ""
+echo "  Enter device paths one by one. When finished, type DONE (all uppercase)."
+echo "  Example device: /dev/sdb"
+echo ""
+
+DEVICES=()
+while true; do
+  read -rp "  Enter device path (or DONE to finish): " DEV
+  if [[ "$DEV" == "DONE" ]]; then
+    break
   fi
-}
 
-create_samba_users_and_shares() {
-  echo
-  echo "Creating Samba users and isolated per-user shares."
-  echo "A directory ${MOUNTPOINT}/<username> will be created for each Samba user."
-  echo "Type DONE (uppercase) to finish."
+  if [[ -z "$DEV" ]]; then
+    echo "  No input provided. Please enter a device path or DONE."
+    continue
+  fi
 
-  # Loop until DONE
-  while true; do
-    read -rp "Enter username (or type DONE to finish): " USERNAME
-    if [ "$USERNAME" = "DONE" ]; then
-      echo "Finished creating users."
+  if [[ ! -b "$DEV" ]]; then
+    echo "  '$DEV' is not a valid block device. Please check and try again."
+    continue
+  fi
+
+  # check for duplicates
+  dup=false
+  for d in "${DEVICES[@]}"; do
+    if [[ "$d" == "$DEV" ]]; then
+      dup=true
       break
     fi
-
-    # basic validation
-    if [[ -z "$USERNAME" ]]; then
-      echo "Username cannot be empty. Try again."
-      continue
-    fi
-
-    # If user exists, note it; otherwise create system user w/ home under mount and nologin
-    if id "$USERNAME" &>/dev/null; then
-      echo "System user $USERNAME exists; re-using."
-    else
-      echo "Creating system user $USERNAME (no login, home: ${MOUNTPOINT}/${USERNAME})..."
-      useradd --home-dir "${MOUNTPOINT}/${USERNAME}" --no-create-home --shell /sbin/nologin "$USERNAME" || useradd -M -s /sbin/nologin -d "${MOUNTPOINT}/${USERNAME}" "$USERNAME" || true
-    fi
-
-    SHARE_DIR="${MOUNTPOINT}/${USERNAME}"
-    mkdir -p "$SHARE_DIR"
-    chown "$USERNAME":"$USERNAME" "$SHARE_DIR"
-    chmod 0700 "$SHARE_DIR"
-
-    # Prompt for Samba password interactively
-    echo "Set SMB password for $USERNAME (you will be prompted twice):"
-    # Use smbpasswd interactive instead of -s for better security prompt
-    if command -v smbpasswd &>/dev/null; then
-      smbpasswd -a "$USERNAME" || true
-      smbpasswd -e "$USERNAME" || true
-    else
-      echo "smbpasswd command not found. Install samba client utilities (samba, samba-common-bin) and set password manually."
-    fi
-
-    # Append per-user share to smb.conf
-    cat >> /etc/samba/smb.conf <<EOF
-
-[${USERNAME}]
-   path = ${SHARE_DIR}
-   valid users = ${USERNAME}
-   read only = no
-   browsable = no
-   guest ok = no
-   create mask = 0700
-   directory mask = 0700
-EOF
-
-    # Ensure ACLs (user-only rwx and default)
-    if command -v setfacl &>/dev/null; then
-      setfacl -R -m u:"$USERNAME":rwx "$SHARE_DIR" || true
-      setfacl -d -m u:"$USERNAME":rwx "$SHARE_DIR" || true
-    fi
-
-    echo "Created Samba share for $USERNAME at $SHARE_DIR"
   done
-
-  # Validate smb configuration
-  if command -v testparm &>/dev/null; then
-    echo "Validating smb.conf with testparm..."
-    testparm -s || true
+  if $dup; then
+    echo "  '$DEV' already added. Choose another device or type DONE."
+    continue
   fi
-}
 
-restart_and_enable_services() {
-  echo "Restarting and enabling Samba services..."
-  # Try common service names
-  systemctl restart smb nmb 2>/dev/null || systemctl restart samba 2>/dev/null || true
-  systemctl enable smb nmb 2>/dev/null || systemctl enable samba 2>/dev/null || true
-}
+  DEVICES+=("$DEV")
+  echo "  Added: $DEV (total selected: ${#DEVICES[@]})"
+done
 
-######### Main flow #########
-echo "Starting Samba setup for mount point: ${MOUNTPOINT}"
+# Validate number of devices
+if (( ${#DEVICES[@]} < 2 )); then
+  error_exit "At least two devices are required for RAID 1. Exiting."
+fi
 
-# Apply permissions & ACLs
-set_permissions_acls
+# Confirm devices
+echo ""
+echo "  You have selected the following devices for RAID 1:"
+for d in "${DEVICES[@]}"; do
+  echo "   - $d"
+done
+read -rp "  Confirm these are the correct devices to format and use for RAID 1? (y/N): " confirm_devices
+confirm_devices=${confirm_devices:-N}
+if [[ ! "$confirm_devices" =~ ^[Yy]$ ]]; then
+  error_exit "Device selection cancelled. Exiting."
+fi
+clear
 
-# Ensure services and firewall
-enable_services_and_firewall
+# Zero Superblocks 
+echo "-------------------------------------------------------------------"
+echo "  --- Zeroing Superblocks on Selected Devices ---"
+echo "-------------------------------------------------------------------"
+echo "  This will destroy any existing RAID metadata or filesystems on the selected devices."
+read -rp "  Are you absolutely sure you want to proceed with zeroing superblocks? (y/N): " confirm_zero
+confirm_zero=${confirm_zero:-N}
+if [[ ! "$confirm_zero" =~ ^[Yy]$ ]]; then
+  error_exit "Zeroing superblocks cancelled. Exiting."
+fi
 
-# SELinux configuration
-configure_selinux_for_samba
+for dev in "${DEVICES[@]}"; do
+  echo "  Zeroing superblock on $dev..."
+  mdadm --zero-superblock "$dev" || echo "  Warning: Failed to zero superblock on $dev. Continuing..."
+done
+echo "  Superblocks zeroed (or skipped where failing)."
+echo "-------------------------------------------------------------------"
+sleep 2
 
-# Backup smb.conf
-backup_smb_conf
+# Create RAID 1 Array
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- Creating RAID 1 Array ---"
+echo "-------------------------------------------------------------------"
+echo "  Creating RAID 1 array '$RAID_ARRAY_NAME' with ${#DEVICES[@]} devices..."
+mdadm --create "$RAID_ARRAY_NAME" --level=1 --raid-devices=${#DEVICES[@]} "${DEVICES[@]}" || error_exit "Failed to create RAID array."
+echo "  RAID 1 array creation initiated. This may take some time to synchronize."
+echo "  You can monitor synchronization status using: 'cat /proc/mdstat'"
+echo ""
+echo "  Current RAID status:"
+cat /proc/mdstat
+echo "-------------------------------------------------------------------"
+sleep 5
 
-# Create users and per-user shares
-create_samba_users_and_shares
+# Persist RAID Configuration 
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- Persisting RAID Configuration ---"
+echo "-------------------------------------------------------------------"
+echo "  Saving RAID array configuration to /etc/mdadm.conf..."
+mdadm --detail --scan > /etc/mdadm.conf || error_exit "Failed to save /etc/mdadm.conf. Manual intervention required."
+echo "  RAID configuration saved."
 
-# Restart/enable services
-restart_and_enable_services
+echo "  Updating initramfs to ensure boot with RAID array..."
+dracut -H -f /boot/initramfs-$(uname -r).img $(uname -r) || echo "  Warning: Failed to update initramfs. System may still boot but check manually."
+echo "  Initramfs update attempted."
+echo "-------------------------------------------------------------------"
+sleep 2
 
-echo "Samba setup complete. Per-user shares live under ${MOUNTPOINT}."
-echo "If SELinux is enabled, verify contexts with: ls -Z ${MOUNTPOINT}"
-echo "If firewall is present, Samba ports/service should be allowed."
+# Format RAID Array 
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- Formatting RAID Array ---"
+echo "-------------------------------------------------------------------"
+echo "  Formatting '$RAID_ARRAY_NAME' with $FILESYSTEM_TYPE filesystem..."
+mkfs.$FILESYSTEM_TYPE "$RAID_ARRAY_NAME" || error_exit "Failed to format RAID array '$RAID_ARRAY_NAME'."
+echo "  RAID array formatted successfully."
+echo "-------------------------------------------------------------------"
+sleep 2
+
+# Configure Mount Point and fstab 
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- Configuring Mount Point and fstab ---"
+echo "-------------------------------------------------------------------"
+read -rp "  Enter the desired mount point for the RAID array (e.g., '$DEFAULT_MOUNT_POINT', leave empty for default): " CUSTOM_MOUNT_POINT
+CUSTOM_MOUNT_POINT=${CUSTOM_MOUNT_POINT:-$DEFAULT_MOUNT_POINT}
+
+echo "  Creating mount point directory '$CUSTOM_MOUNT_POINT'..."
+mkdir -p "$CUSTOM_MOUNT_POINT" || error_exit "Failed to create mount point directory '$CUSTOM_MOUNT_POINT'."
+echo "  Mount point created."
+
+echo "  Adding entry to /etc/fstab for automatic mounting..."
+echo "$RAID_ARRAY_NAME $CUSTOM_MOUNT_POINT $FILESYSTEM_TYPE defaults 0 0" >> /etc/fstab || error_exit "Failed to update /etc/fstab. Manual edit required."
+echo "  fstab updated. Verifying fstab entry..."
+
+echo "  Mounting RAID array to '$CUSTOM_MOUNT_POINT'..."
+mount "$CUSTOM_MOUNT_POINT" || error_exit "Failed to mount RAID array to '$CUSTOM_MOUNT_POINT'. Check fstab and logs."
+echo "  RAID array mounted successfully."
+echo "-------------------------------------------------------------------"
+sleep 2
+
+# Set Permissions 
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- Setting Permissions on Mount Point ---"
+echo "-------------------------------------------------------------------"
+read -rp "  Enter desired owner for '$CUSTOM_MOUNT_POINT' (e.g., 'user:group', default '$DEFAULT_OWNER'): " CUSTOM_OWNER
+CUSTOM_OWNER=${CUSTOM_OWNER:-$DEFAULT_OWNER}
+
+echo "  Setting ownership of '$CUSTOM_MOUNT_POINT' to '$CUSTOM_OWNER'..."
+chown -R "$CUSTOM_OWNER" "$CUSTOM_MOUNT_POINT" || echo "  Warning: Failed to set ownership. Manual intervention might be needed."
+
+read -rp "  Enter desired permissions for '$CUSTOM_MOUNT_POINT' (e.g., '0770', default '$DEFAULT_CHMOD'): " CUSTOM_CHMOD
+if [ -n "$CUSTOM_CHMOD" ]; then 
+  if [[ ! "$CUSTOM_CHMOD" =~ ^[0-7]{3,4}$ ]]; then
+    echo "  Warning: Invalid chmod format. Using default '$DEFAULT_CHMOD'."
+    CUSTOM_CHMOD="$DEFAULT_CHMOD"
+  fi
+else
+  CUSTOM_CHMOD="$DEFAULT_CHMOD"
+fi
+echo "  Setting permissions of '$CUSTOM_MOUNT_POINT' to '$CUSTOM_CHMOD'..."
+chmod "$CUSTOM_CHMOD" "$CUSTOM_MOUNT_POINT" || echo "  Warning: Failed to set permissions. Manual intervention might be needed."
+echo "  Permissions set."
+echo "-------------------------------------------------------------------"
+sleep 2
+
+# Verification 
+clear
+echo "-------------------------------------------------------------------"
+echo "  --- RAID 1 Setup Completed ---"
+echo "-------------------------------------------------------------------"
+echo "  Summary of RAID configuration:"
+echo ""
+echo "  RAID Array: $RAID_ARRAY_NAME (RAID 1)"
+echo -n "  Devices:    "
+printf "%s " "${DEVICES[@]}"
+echo ""
+echo "  Filesystem: $FILESYSTEM_TYPE"
+echo "  Mount Point: $CUSTOM_MOUNT_POINT"
+echo "  Owner:      $CUSTOM_OWNER"
+echo "  Permissions: $CUSTOM_CHMOD"
+echo ""
+echo "  Current disk usage and mounts:"
+df -h "$CUSTOM_MOUNT_POINT" 2>/dev/null || echo "  Failed to display mount status for $CUSTOM_MOUNT_POINT. Check 'df -h'."
+echo ""
+echo "  RAID status (check for 'resync' progress if any):"
+cat /proc/mdstat
+echo ""
+echo "  Final lsblk output:"
+lsblk -f
+echo ""
+echo "-------------------------------------------------------------------"
+echo "  RAID 1 array has been successfully created, formatted, and mounted."
+echo "  It is configured to mount automatically on boot."
+echo "-------------------------------------------------------------------"
+echo ""
 
 exit 0
